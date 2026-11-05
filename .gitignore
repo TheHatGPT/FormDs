@@ -1,0 +1,35 @@
+# Secrets & Environment Variables (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+
+# Local Databases & Runtime State
+*.db
+*.sqlite
+*.sqlite3
+data/
+logs/
+
+# Python Virtual Environments & Bytecode
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.spec
+*.exe
+
+# Playwright & Browser State
+.playwright/
+playwright-report/
+test-results/
+
+# OS / IDE Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
