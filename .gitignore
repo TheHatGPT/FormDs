@@ -1,12 +1,14 @@
 # Secrets & Environment Variables (NEVER COMMIT)
 .env
 .env.*
+.deploy.env
 !.env.example
 
 # Local Databases & Runtime State
 *.db
 *.sqlite
 *.sqlite3
+*.log
 data/
 logs/
 

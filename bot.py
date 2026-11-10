@@ -35,14 +35,22 @@ def is_authorized_owner(user_id: int) -> bool:
     return bool(settings.AUTHORIZED_USER_IDS) and user_id in settings.AUTHORIZED_USER_IDS
 
 
+def _clickable_url(url: str) -> str:
+    """Ensures a URL has an http/https scheme and is returned as a bare URL so Discord auto-links it."""
+    u = url.strip()
+    if u and not u.startswith(("http://", "https://")):
+        return f"https://{u}"
+    return u
+
+
 def build_filing_embed(filing: NormalizedFiling, run: AuditRun) -> discord.Embed:
     """Formats the 7 required company metadata fields into a clean Discord DM Embed."""
     source_badge = "🇺🇸 SEC EDGAR (Form D)" if filing.source == "SEC_EDGAR" else "🇨🇦 SEDAR+ (45-106F1)"
+    clean_site = _clickable_url(filing.company_website) if filing.company_website else ""
     website_display = (
-        f"[{filing.company_website}]({filing.company_website}) "
-        f"*(TypeSafe QC: {filing.website_confidence:.0%})*"
-        if filing.company_website and filing.website_confidence is not None
-        else (filing.company_website or "Not found / did not pass TypeSafe QC")
+        f"{clean_site} *(TypeSafe QC: {filing.website_confidence:.0%})*"
+        if clean_site and filing.website_confidence is not None
+        else (clean_site or "Not found / did not pass TypeSafe QC")
     )
 
     embed = discord.Embed(
@@ -104,11 +112,11 @@ def build_executive_embed(exec_data: EnrichedExecutive) -> discord.Embed:
         description=f"**Company:** {exec_data.company_name}",
         color=discord.Color.from_rgb(52, 152, 219),
     )
+    clean_li = _clickable_url(exec_data.linkedin_url) if exec_data.linkedin_url else ""
     li_val = (
-        f"[{exec_data.linkedin_url}]({exec_data.linkedin_url}) "
-        f"*(TypeSafe QC: {exec_data.linkedin_confidence:.0%})*"
-        if exec_data.linkedin_url and exec_data.linkedin_confidence is not None
-        else (exec_data.linkedin_url or "None verified")
+        f"{clean_li} *(TypeSafe QC: {exec_data.linkedin_confidence:.0%})*"
+        if clean_li and exec_data.linkedin_confidence is not None
+        else (clean_li or "None verified")
     )
     embed.add_field(name="1. LinkedIn Profile", value=li_val, inline=False)
     embed.add_field(
@@ -482,10 +490,14 @@ class FormDScoutBot(discord.Client):
                 await message.reply(msg)
             return
 
-        # 3. Audit Last Run ("audit", "audit last", "audit <id>")
-        if lower.startswith("audit"):
+        # 3. Audit Last Run / Inspect Exa Queries ("audit", "queries", "exa queries", "audit <id>")
+        if lower.startswith("audit") or lower in ("queries", "exa queries", "exa"):
             parts = text.split(maxsplit=1)
-            run_id = parts[1].strip() if len(parts) > 1 and parts[1].lower() != "last" else None
+            run_id = (
+                parts[1].strip()
+                if lower.startswith("audit") and len(parts) > 1 and parts[1].lower() != "last"
+                else None
+            )
             run = self.store.get_audit(run_id)
             if not run:
                 await message.reply("No audit runs recorded yet.")

@@ -70,7 +70,7 @@ class AuditSession:
                     step_name=recorder.step_name,
                     provider=recorder.provider,
                     status=recorder.status,  # type: ignore[arg-type]
-                    detail=recorder.detail[:300],
+                    detail=recorder.detail[:800],
                     input_tokens=recorder.input_tokens,
                     output_tokens=recorder.output_tokens,
                     cost_usd=round(recorder.cost_usd, 7),
@@ -83,13 +83,20 @@ class AuditSession:
         return self.run
 
     def format_discord_report(self) -> str:
-        """Renders a concise, human-readable step & cost breakdown for Discord DMs."""
+        """Renders a concise, human-readable step & cost breakdown (including full Exa queries per hop) for Discord DMs."""
         lines = [
             f"### 🧾 Audit Report (`{self.run.run_id}`) — **{self.run.target_label}**",
             f"**Outcome:** `{self.run.outcome}` | "
             f"**Total Tokens:** `{self.run.total_tokens:,}` | "
             f"**Total Cost:** `${self.run.total_cost_usd:.6f}`\n",
         ]
+        exa_steps = [s for s in self.run.steps if s.provider == "exa"]
+        if exa_steps:
+            lines.append("**🔎 Exa Queries by Hop:**")
+            for es in exa_steps:
+                lines.append(f"• **{es.step_name}:** {es.detail}")
+            lines.append("")
+
         for s in self.run.steps:
             icon = {"PASS": "✅", "FAIL": "❌", "INFO": "🔹", "ERROR": "⚠️"}.get(
                 s.status, "🔹"
@@ -102,6 +109,6 @@ class AuditSession:
             lines.append(
                 f"{icon} **Step {s.step_number}: {s.step_name}** (`{s.provider}`)\n"
                 f"   ↳ Cost: `${s.cost_usd:.6f}` | Tokens: `{tok_str}` | Time: `{s.duration_ms}ms`\n"
-                f"   ↳ _{s.detail or s.status}_"
+                f"   ↳ {s.detail or s.status}"
             )
         return "\n".join(lines)

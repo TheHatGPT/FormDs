@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Protocol
+from urllib.parse import urlparse
+import dns.resolver
 import httpx
 from apify_client import ApifyClientAsync
 
@@ -37,6 +39,132 @@ def clean_brand_name(name: str) -> str:
     cleaned = re.sub(pattern, "", name)
     cleaned = re.sub(r"[\s,]+", " ", cleaned).strip()
     return cleaned or name
+
+
+_RESERVED_GH_PATHS = {
+    "features", "orgs", "topics", "pricing", "login", "join", "about",
+    "settings", "site", "security", "sponsors", "marketplace", "explore",
+    "notifications", "pulls", "issues", "codespaces", "enterprise", "readme",
+}
+
+
+def _is_safe_public_url(url: str) -> bool:
+    """SSRF defense: allows only http/https URLs on public internet hostnames."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        host = parsed.hostname.lower()
+        if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or host.endswith(
+            (".local", ".internal", ".lan")
+        ):
+            return False
+        if re.match(r"^(?:10\.|127\.|169\.254\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)", host):
+            return False
+        return "." in host
+    except Exception:
+        return False
+
+
+def _extract_emails_from_text(text: str) -> list[str]:
+    """Extracts clean email addresses from HTML/text while ignoring image filenames and noreply addresses."""
+    raw = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,12}", text)
+    cleaned: list[str] = []
+    bad_Fragments = (
+        "noreply", "no-reply", "example.com", "sentry.io", "wixpress.com",
+        "github.com", "2x.png", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js",
+    )
+    for e in raw:
+        el = e.lower().strip(".")
+        if not any(b in el for b in bad_Fragments) and el not in cleaned:
+            cleaned.append(el)
+    return cleaned
+
+
+async def _scrape_public_page_signals(
+    client: httpx.AsyncClient, url: str
+) -> dict[str, list[str]]:
+    """Fetches up to 250KB from a public URL and extracts GitHub repos/users, LinkedIn, socials, and emails."""
+    signals: dict[str, list[str]] = {
+        "github_repos": [],
+        "github_users": [],
+        "linkedin_urls": [],
+        "emails": [],
+    }
+    if not _is_safe_public_url(url):
+        return signals
+    try:
+        resp = await client.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; FormDScoutBot/1.0)"},
+            timeout=6.0,
+        )
+        if resp.status_code != 200:
+            return signals
+        html = resp.text[:250_000]
+
+        for m in re.finditer(
+            r"https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)(?:/([A-Za-z0-9_.-]+))?",
+            html,
+        ):
+            owner = m.group(1).strip("/")
+            repo = (m.group(2) or "").strip("/")
+            if owner.lower() in _RESERVED_GH_PATHS:
+                continue
+            if repo and repo.lower() not in _RESERVED_GH_PATHS:
+                slug = f"{owner}/{repo}"
+                if slug not in signals["github_repos"]:
+                    signals["github_repos"].append(slug)
+            elif owner not in signals["github_users"]:
+                signals["github_users"].append(owner)
+
+        for m_li in re.finditer(
+            r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/in/[A-Za-z0-9_%-]+/?", html
+        ):
+            li_url = m_li.group(0).rstrip("/")
+            if li_url not in signals["linkedin_urls"]:
+                signals["linkedin_urls"].append(li_url)
+
+        for email in _extract_emails_from_text(html):
+            if email not in signals["emails"]:
+                signals["emails"].append(email)
+    except Exception:
+        pass
+    return signals
+
+
+def _extract_candidate_handles(items: list[str]) -> list[str]:
+    """Extracts clean username handles from '@handle' strings or profile URLs."""
+    handles: list[str] = []
+    for item in items:
+        s = item.strip()
+        if s.startswith("@") and len(s) > 2:
+            h = re.sub(r"[^A-Za-z0-9_.-]", "", s[1:])
+            if h and h.lower() not in handles:
+                handles.append(h.lower())
+            continue
+        m = re.search(
+            r"(?:github\.com|x\.com|twitter\.com|teapawt\.org|bsky\.app/profile|medium\.com/@|dev\.to)/([A-Za-z0-9_.-]+)",
+            s,
+            re.I,
+        )
+        if m:
+            h = m.group(1).lstrip("@")
+            if h.lower() not in _RESERVED_GH_PATHS and h.lower() not in handles:
+                handles.append(h.lower())
+    return handles
+
+
+def _has_valid_mx_record(email: str) -> bool:
+    """Verifies via DNS that the email domain has active mail exchange (MX) servers."""
+    if "@" not in email:
+        return False
+    domain = email.split("@", 1)[1].strip()
+    try:
+        answers = dns.resolver.resolve(domain, "MX", lifetime=4.0)
+        return len(answers) > 0
+    except Exception:
+        return False
 
 
 class OpenRouterClient:
@@ -228,9 +356,12 @@ class ExaClient:
                 if isinstance(data.get("costDollars"), dict)
                 else settings.EXA_COST_PER_SEARCH_USD
             )
+            domains_note = f" [domains: {', '.join(include_domains)}]" if include_domains else ""
+            top_urls = ", ".join(r.get("url", "") for r in results[:3] if r.get("url"))
+            urls_note = f" → Top hits: {top_urls}" if top_urls else ""
             step.record(
                 status="PASS" if results else "INFO",
-                detail=f"Exa returned {len(results)} result(s) for '{query[:60]}'",
+                detail=f"Query: `{query}`{domains_note} ({len(results)} result(s)){urls_note}",
                 cost_usd=cost_usd,
             )
             return results
@@ -252,8 +383,8 @@ class ContactEnricher(Protocol):
 
 class ApifyContactEnricher:
     """
-    Finds an executive's email from their LinkedIn URL via `vulnv/linkedin-email-finder`
-    and validates deliverability via `michael.g/email-verifier-validator`.
+    Finds an executive's email (via pre-discovered GitHub/web emails or `vulnv/linkedin-email-finder`)
+    and validates deliverability via `michael.g/email-verifier-validator` + DNS MX verification.
     """
 
     async def find_and_verify_email(
@@ -263,103 +394,130 @@ class ApifyContactEnricher:
         company_website: str | None,
         linkedin_url: str | None,
         audit: AuditSession,
+        discovered_emails: list[str] | None = None,
     ) -> tuple[str | None, str]:
-        if not linkedin_url:
-            return None, "Skipped (No verified LinkedIn profile found)"
+        candidate_email: str | None = (
+            discovered_emails[0].strip() if discovered_emails else None
+        )
+        source_label = "GitHub/Web Pivot" if candidate_email else "LinkedIn"
 
-        if not settings.APIFY_API_TOKEN:
-            with audit.step("Apify Email Lookup", provider="apify") as step:
-                step.record(status="INFO", detail="APIFY_API_TOKEN not set.")
-            return None, "Skipped (APIFY_API_TOKEN missing)"
+        # Step 1: Only call vulnv/linkedin-email-finder if we don't already have a pivoted email
+        if not candidate_email:
+            if not linkedin_url:
+                return None, "Skipped (No LinkedIn profile or GitHub/Web email found)"
 
-        candidate_email: str | None = None
+            if not settings.APIFY_API_TOKEN:
+                with audit.step("Apify Email Lookup", provider="apify") as step:
+                    step.record(status="INFO", detail="APIFY_API_TOKEN not set.")
+                return None, "Skipped (APIFY_API_TOKEN missing)"
 
-        # Step 1: vulnv/linkedin-email-finder
-        with audit.step(
-            f"Apify Email Finder ({settings.APIFY_LINKEDIN_EMAIL_ACTOR})",
-            provider="apify",
-        ) as step1:
-            actor_slug = settings.APIFY_LINKEDIN_EMAIL_ACTOR.replace("/", "~")
-            run_url = (
-                f"https://api.apify.com/v2/acts/{actor_slug}/run-sync-get-dataset-items"
-                f"?token={settings.APIFY_API_TOKEN}&timeout=120"
-            )
-            payload1 = {
-                "linkedinUrl": linkedin_url,
-                "url": linkedin_url,
-                "urls": [linkedin_url],
-            }
-            items: list[dict[str, Any]] = []
-            cost1 = 0.005  # Standard actor credit estimate
-            async with httpx.AsyncClient(timeout=130.0) as client:
-                try:
-                    resp1 = await client.post(run_url, json=payload1)
-                    if resp1.status_code in (200, 201):
-                        data1 = resp1.json()
-                        items = data1 if isinstance(data1, list) else [data1]
-                    else:
-                        step1.record(status="INFO", detail=f"Apify HTTP {resp1.status_code}")
-                except Exception as exc:
-                    step1.record(status="ERROR", detail=f"Apify call failed: {exc}")
+            with audit.step(
+                f"Apify Email Finder ({settings.APIFY_LINKEDIN_EMAIL_ACTOR})",
+                provider="apify",
+            ) as step1:
+                actor_slug = settings.APIFY_LINKEDIN_EMAIL_ACTOR.replace("/", "~")
+                run_url = (
+                    f"https://api.apify.com/v2/acts/{actor_slug}/run-sync-get-dataset-items"
+                    f"?token={settings.APIFY_API_TOKEN}&timeout=120"
+                )
+                payload1 = {
+                    "linkedinUrl": linkedin_url,
+                    "url": linkedin_url,
+                    "urls": [linkedin_url],
+                }
+                items: list[dict[str, Any]] = []
+                cost1 = 0.005
+                async with httpx.AsyncClient(timeout=130.0) as client:
+                    try:
+                        resp1 = await client.post(run_url, json=payload1)
+                        if resp1.status_code in (200, 201):
+                            data1 = resp1.json()
+                            items = data1 if isinstance(data1, list) else [data1]
+                        else:
+                            step1.record(status="INFO", detail=f"Apify HTTP {resp1.status_code}")
+                    except Exception as exc:
+                        step1.record(status="ERROR", detail=f"Apify call failed: {exc}")
 
-            for item in items:
-                for key in ("email", "emailAddress", "work_email", "personal_email"):
-                    val = _safe_get(item, key)
-                    if isinstance(val, str) and "@" in val:
-                        candidate_email = val.strip()
+                for item in items:
+                    for key in ("email", "emailAddress", "work_email", "personal_email"):
+                        val = _safe_get(item, key)
+                        if isinstance(val, str) and "@" in val:
+                            candidate_email = val.strip()
+                            break
+                    if candidate_email:
                         break
-                if candidate_email:
-                    break
 
-            step1.record(
-                status="PASS" if candidate_email else "INFO",
-                detail=(
-                    f"Found candidate email: {candidate_email}"
-                    if candidate_email
-                    else "No email found for LinkedIn URL"
-                ),
-                cost_usd=cost1,
-            )
+                step1.record(
+                    status="PASS" if candidate_email else "INFO",
+                    detail=(
+                        f"Found candidate email: {candidate_email}"
+                        if candidate_email
+                        else "No email found for LinkedIn URL"
+                    ),
+                    cost_usd=cost1,
+                )
 
         if not candidate_email:
             return None, "No email associated with LinkedIn profile"
 
-        # Step 2: michael.g/email-verifier-validator
+        # Step 2: michael.g/email-verifier-validator (+ DNS MX fallback verification)
         with audit.step(
-            f"Apify Email Verifier ({settings.APIFY_EMAIL_VERIFIER_ACTOR})",
+            f"Verify Email ({candidate_email} via {settings.APIFY_EMAIL_VERIFIER_ACTOR})",
             provider="apify",
         ) as step2:
-            actor_slug2 = settings.APIFY_EMAIL_VERIFIER_ACTOR.replace("/", "~")
-            run_url2 = (
-                f"https://api.apify.com/v2/acts/{actor_slug2}/run-sync-get-dataset-items"
-                f"?token={settings.APIFY_API_TOKEN}&timeout=120"
-            )
-            payload2 = {
-                "emails": [candidate_email],
-                "email": candidate_email,
-            }
-            items2: list[dict[str, Any]] = []
-            cost2 = 0.005
-            async with httpx.AsyncClient(timeout=130.0) as client:
-                try:
-                    resp2 = await client.post(run_url2, json=payload2)
-                    if resp2.status_code in (200, 201):
-                        data2 = resp2.json()
-                        items2 = data2 if isinstance(data2, list) else [data2]
-                    else:
-                        step2.record(status="INFO", detail=f"Apify HTTP {resp2.status_code}")
-                except Exception as exc:
-                    step2.record(status="ERROR", detail=f"Apify call failed: {exc}")
-
             is_valid = False
             status_str = "Unverified"
-            if items2:
-                first = items2[0]
-                raw_status = str(
-                    _safe_get(first, "status", "result", "deliverable", "isValid", "is_valid") or ""
-                ).lower()
-                is_valid = raw_status in ("valid", "deliverable", "true", "ok", "safe")
-                status_str = f"Verified ({raw_status})" if is_valid else f"Invalid ({raw_status})"
+            cost2 = 0.0
+            if settings.APIFY_API_TOKEN:
+                actor_slug2 = settings.APIFY_EMAIL_VERIFIER_ACTOR.replace("/", "~")
+                run_url2 = (
+                    f"https://api.apify.com/v2/acts/{actor_slug2}/run-sync-get-dataset-items"
+                    f"?token={settings.APIFY_API_TOKEN}&timeout=120"
+                )
+                payload2 = {
+                    "emails": [candidate_email],
+                    "email": candidate_email,
+                }
+                items2: list[dict[str, Any]] = []
+                async with httpx.AsyncClient(timeout=130.0) as client:
+                    try:
+                        resp2 = await client.post(run_url2, json=payload2)
+                        if resp2.status_code in (200, 201):
+                            cost2 = 0.005
+                            data2 = resp2.json()
+                            items2 = data2 if isinstance(data2, list) else [data2]
+                    except Exception:
+                        pass
+
+                if items2:
+                    first = items2[0]
+                    raw_status = str(
+                        _safe_get(first, "status", "result", "deliverable", "isValid", "is_valid") or ""
+                    ).lower()
+                    if raw_status in (
+                        "valid",
+                        "deliverable",
+                        "true",
+                        "ok",
+                        "safe",
+                        "risky",
+                        "catch-all",
+                        "catch_all",
+                        "accept_all",
+                        "accept-all",
+                    ):
+                        is_valid = True
+                        status_str = f"Verified via Apify ({raw_status}, source: {source_label})"
+                    elif raw_status:
+                        status_str = f"Invalid ({raw_status})"
+
+            # Fallback / Secondary Check: DNS MX verification if Apify verifier returned no items
+            if not is_valid and status_str == "Unverified":
+                if _has_valid_mx_record(candidate_email):
+                    is_valid = True
+                    status_str = f"Verified ({source_label} + Active MX Domain)"
+                else:
+                    status_str = "Invalid (No MX record)"
 
             step2.record(
                 status="PASS" if is_valid else "FAIL",
@@ -495,11 +653,11 @@ class EnrichmentPipeline:
         audit: AuditSession,
     ) -> EnrichedExecutive:
         """
-        On-demand deep-dive for a chosen Executive Director:
-        1. Exa searches for LinkedIn profile, social media handles, blogs, and personal websites.
-        2. OpenRouter structures candidate links from Exa results.
-        3. TypeSafe AI (`noul`) verifies each candidate belongs to this exact Executive Director.
-        4. Apify (`vulnv/linkedin-email-finder` + `michael.g/email-verifier-validator`) finds & validates email.
+        3-Hop Chained Investigation for a chosen Executive Director:
+        - Hop 1: Domain-aware Exa search (LinkedIn, socials, blogs, websites) + OpenRouter structuring.
+        - Hop 2: Handle & GitHub API Pivot (scrapes company website & social pages for GitHub repos/handles,
+                 queries GitHub API for user profile, personal website `blog`, and commit author emails).
+        - Hop 3: TypeSafe AI (`noul`) parallel verification + Apify/MX email validation.
         """
         result = EnrichedExecutive(
             full_name=exec_info.full_name,
@@ -508,36 +666,39 @@ class EnrichmentPipeline:
         )
 
         brand = clean_brand_name(filing.company_name)
+        domain = ""
+        if filing.company_website:
+            domain = (urlparse(filing.company_website).hostname or "").lower().removeprefix("www.")
+        brand_or_domain = f'("{brand}" OR "{domain}")' if domain else f'"{brand}"'
 
-        # 1. Exa Search for LinkedIn
+        # --- HOP 1: Exa Search + OpenRouter Candidate Extraction ---
         li_results = await self.exa.search(
-            f'"{exec_info.full_name}" "{brand}" site:linkedin.com/in/',
+            f'"{exec_info.full_name}" {brand_or_domain} site:linkedin.com/in/',
             num_results=3,
             include_domains=["linkedin.com"],
             audit=audit,
-            step_name=f"Exa LinkedIn Search ({exec_info.full_name})",
+            step_name=f"Hop 1a: Exa LinkedIn Search ({exec_info.full_name})",
         )
 
-        # 2. Exa Search for Socials, Blogs, and Personal Websites
         web_results = await self.exa.search(
-            f'"{exec_info.full_name}" "{brand}" (twitter OR x.com OR github OR substack OR medium OR blog OR personal website)',
+            f'"{exec_info.full_name}" {brand_or_domain} (github OR twitter OR x.com OR substack OR medium OR blog OR personal website)',
             num_results=6,
             audit=audit,
-            step_name=f"Exa Socials/Blog/Website Search ({exec_info.full_name})",
+            step_name=f"Hop 1b: Exa Socials/Blog/Website Search ({exec_info.full_name})",
         )
 
-        # 3. Structure candidates via OpenRouter
         structured = await self.openrouter.chat_json(
             system_prompt=(
-                "Extract candidate profile links for the specified executive from the search results. "
+                "Extract candidate profile links, handles, and emails for the specified executive from the search results. "
                 "Return strict JSON: "
-                '{"linkedin_urls": [str], "social_handles": [str], "blogs": [str], "personal_websites": [str]}'
+                '{"linkedin_urls": [str], "social_handles": [str], "blogs": [str], "personal_websites": [str], "emails": [str]}'
             ),
             user_prompt=json.dumps(
                 {
                     "executive": exec_info.full_name,
                     "roles": exec_info.roles,
                     "company": filing.company_name,
+                    "company_website": filing.company_website,
                     "linkedin_search": [
                         {"url": r.get("url"), "title": r.get("title"), "text": r.get("text")}
                         for r in li_results
@@ -549,7 +710,7 @@ class EnrichmentPipeline:
                 }
             ),
             audit=audit,
-            step_name=f"OpenRouter Candidate Extraction ({exec_info.full_name})",
+            step_name=f"Hop 1c: OpenRouter Candidate Extraction ({exec_info.full_name})",
         )
 
         li_cands = [u for u in structured.get("linkedin_urls", []) if isinstance(u, str)]
@@ -559,38 +720,248 @@ class EnrichmentPipeline:
         social_cands = [u for u in structured.get("social_handles", []) if isinstance(u, str)]
         blog_cands = [u for u in structured.get("blogs", []) if isinstance(u, str)]
         site_cands = [u for u in structured.get("personal_websites", []) if isinstance(u, str)]
+        email_cands = [e for e in structured.get("emails", []) if isinstance(e, str) and "@" in e]
 
-        # 4. TypeSafe AI Parallel QC over all extracted candidates
+        # Also harvest raw URLs from Exa web_results for handle extraction
+        raw_web_urls = [r.get("url", "") for r in web_results if r.get("url")]
+
+        # --- HOP 2: Multi-Hop Handle, Website & GitHub API Pivot ($0.00 Free Pivot) ---
+        gh_profile_evidence: list[dict[str, Any]] = []
+        with audit.step(
+            f"Hop 2: Handle & GitHub API Pivot ({exec_info.full_name})", provider="local"
+        ) as pivot_step:
+            discovered_repos: list[str] = []
+            candidate_handles = _extract_candidate_handles(
+                social_cands + blog_cands + site_cands + raw_web_urls
+            )
+
+            gh_headers = {
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "FormDScoutBot/1.0",
+            }
+            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+                # 2a. Scrape company website & top 2 discovered social URLs (e.g. teapawt.org/marchantweb)
+                urls_to_scrape: list[str] = []
+                if filing.company_website:
+                    urls_to_scrape.append(filing.company_website)
+                for u in (social_cands + raw_web_urls)[:3]:
+                    if u.startswith("http") and u not in urls_to_scrape and "linkedin.com" not in u:
+                        urls_to_scrape.append(u)
+
+                for page_url in urls_to_scrape[:3]:
+                    sig = await _scrape_public_page_signals(client, page_url)
+                    for r_slug in sig["github_repos"]:
+                        if r_slug not in discovered_repos:
+                            discovered_repos.append(r_slug)
+                    for g_user in sig["github_users"]:
+                        if g_user.lower() not in candidate_handles:
+                            candidate_handles.append(g_user.lower())
+                    for li_u in sig["linkedin_urls"]:
+                        if li_u not in li_cands:
+                            li_cands.append(li_u)
+                    for em in sig["emails"]:
+                        if em not in email_cands:
+                            email_cands.append(em)
+
+                # 2b. From discovered GitHub repos (e.g. shader-effects-inc/shaders), get top contributors
+                for repo_slug in discovered_repos[:2]:
+                    try:
+                        c_resp = await client.get(
+                            f"https://api.github.com/repos/{repo_slug}/contributors?per_page=5",
+                            headers=gh_headers,
+                        )
+                        if c_resp.status_code == 200 and isinstance(c_resp.json(), list):
+                            for contrib in c_resp.json():
+                                login = (contrib.get("login") or "").strip().lower()
+                                if login and not login.endswith("[bot]") and login not in candidate_handles:
+                                    candidate_handles.append(login)
+                    except Exception:
+                        pass
+
+                # 2c. Also search GitHub users by executive full name
+                try:
+                    q_name = exec_info.full_name.replace(" ", "+")
+                    u_search = await client.get(
+                        f"https://api.github.com/search/users?q={q_name}+in:fullname&per_page=3",
+                        headers=gh_headers,
+                    )
+                    if u_search.status_code == 200:
+                        for item in u_search.json().get("items", []):
+                            login = (item.get("login") or "").strip().lower()
+                            if login and login not in candidate_handles:
+                                candidate_handles.append(login)
+                except Exception:
+                    pass
+
+                # 2d. Inspect each candidate handle on GitHub API (Profile + Public Commits + Personal Website)
+                exec_first = exec_info.first_name.lower() or exec_info.full_name.split()[0].lower()
+                exec_last = exec_info.last_name.lower() or exec_info.full_name.split()[-1].lower()
+
+                for handle in candidate_handles[:4]:
+                    try:
+                        u_resp = await client.get(
+                            f"https://api.github.com/users/{handle}", headers=gh_headers
+                        )
+                        if u_resp.status_code != 200:
+                            continue
+                        gh_user = u_resp.json()
+                        gh_name = (gh_user.get("name") or "").strip()
+                        gh_bio = (gh_user.get("bio") or "").strip()
+                        gh_blog = (gh_user.get("blog") or "").strip()
+                        gh_email = (gh_user.get("email") or "").strip()
+                        gh_twitter = (gh_user.get("twitter_username") or "").strip()
+                        gh_html = gh_user.get("html_url") or f"https://github.com/{handle}"
+
+                        # Check relevance to executive
+                        combined_meta = f"{gh_name} {gh_bio} {gh_blog} {handle}".lower()
+                        if not (
+                            exec_last in combined_meta
+                            or exec_first in combined_meta
+                            or (domain and domain in combined_meta)
+                            or brand.lower() in combined_meta
+                        ):
+                            continue
+
+                        gh_profile_evidence.append(
+                            {
+                                "handle": handle,
+                                "name": gh_name,
+                                "bio": gh_bio,
+                                "blog": gh_blog,
+                                "email": gh_email,
+                                "url": gh_html,
+                            }
+                        )
+                        if gh_html not in social_cands:
+                            social_cands.insert(0, gh_html)
+                        if gh_twitter and f"@{gh_twitter}" not in social_cands:
+                            social_cands.append(f"@{gh_twitter}")
+                        if gh_email and "@" in gh_email and gh_email not in email_cands:
+                            email_cands.insert(0, gh_email)
+
+                        # Normalize and scrape personal website from GitHub `blog` field (e.g. https://marchantweb.com)
+                        if gh_blog:
+                            norm_blog = (
+                                gh_blog
+                                if gh_blog.startswith(("http://", "https://"))
+                                else f"https://{gh_blog}"
+                            )
+                            if norm_blog not in site_cands:
+                                site_cands.insert(0, norm_blog)
+                            blog_sig = await _scrape_public_page_signals(client, norm_blog)
+                            for em in blog_sig["emails"]:
+                                if em not in email_cands:
+                                    email_cands.insert(0, em)
+                            for li_u in blog_sig["linkedin_urls"]:
+                                if li_u not in li_cands:
+                                    li_cands.insert(0, li_u)
+
+                        # Extract author email from public commits (since unauthenticated /users/{handle} hides email)
+                        commit_urls = [
+                            f"https://api.github.com/users/{handle}/events/public?per_page=15",
+                            f"https://api.github.com/search/commits?q=author:{handle}&sort=author-date&per_page=5",
+                        ]
+                        for r_slug in discovered_repos[:2]:
+                            commit_urls.insert(
+                                0,
+                                f"https://api.github.com/repos/{r_slug}/commits?author={handle}&per_page=5",
+                            )
+                        for c_url in commit_urls:
+                            if email_cands:
+                                break
+                            try:
+                                c_r = await client.get(c_url, headers=gh_headers)
+                                if c_r.status_code == 200:
+                                    for em in _extract_emails_from_text(c_r.text):
+                                        if em not in email_cands:
+                                            email_cands.insert(0, em)
+                            except Exception:
+                                pass
+
+                        # If personal website domain exists (e.g. marchantweb.com) and still no email, check common founder address
+                        if gh_blog and not email_cands:
+                            p_dom = (urlparse(norm_blog).hostname or "").lower().removeprefix("www.")
+                            if p_dom and _has_valid_mx_record(f"{exec_first}@{p_dom}"):
+                                email_cands.append(f"{exec_first}@{p_dom}")
+                    except Exception:
+                        pass
+
+            pivot_step.record(
+                status="PASS" if (gh_profile_evidence or site_cands or email_cands) else "INFO",
+                detail=(
+                    f"Scraped={urls_to_scrape[:3]} | Handles={candidate_handles[:4]} | Repos={discovered_repos[:2]} | "
+                    f"GH Profiles={len(gh_profile_evidence)} | Websites={site_cands[:2]} | Emails={email_cands[:2]}"
+                ),
+            )
+
+        # Hop 2b: Conditional Exa Handle Pivot Search (if a handle was found but personal website or LinkedIn is still missing)
+        if candidate_handles and (not site_cands or not li_cands):
+            primary_handle = candidate_handles[0]
+            handle_results = await self.exa.search(
+                f'"{primary_handle}" ("{exec_info.full_name}" OR "{brand}") (website OR blog OR linkedin OR github)',
+                num_results=4,
+                audit=audit,
+                step_name=f"Hop 2b: Exa Handle Pivot Search (@{primary_handle})",
+            )
+            for hr in handle_results:
+                h_url = (hr.get("url") or "").strip()
+                h_text = hr.get("text") or ""
+                if "linkedin.com/in/" in h_url and h_url not in li_cands:
+                    li_cands.append(h_url)
+                elif (
+                    h_url.startswith("http")
+                    and primary_handle.lower() in h_url.lower()
+                    and not any(
+                        s in h_url.lower()
+                        for s in ("github.com", "twitter.com", "x.com", "teapawt.org", "dev.to", "linkedin.com")
+                    )
+                    and h_url not in site_cands
+                ):
+                    site_cands.append(h_url)
+                for em in _extract_emails_from_text(h_text):
+                    if em not in email_cands:
+                        email_cands.append(em)
+                web_results.append(hr)
+
+        # --- HOP 3: TypeSafe AI Parallel QC over all discovered candidates ---
         qc_questions: dict[str, str] = {}
         for i, u in enumerate(li_cands[:3]):
             qc_questions[f"li_{i}"] = (
                 f"The LinkedIn profile '{u}' belongs to {exec_info.full_name}, "
                 f"who is associated with {filing.company_name}."
             )
-        for i, u in enumerate(social_cands[:4]):
+        for i, u in enumerate(social_cands[:5]):
             qc_questions[f"soc_{i}"] = (
-                f"The social media handle/profile '{u}' belongs to {exec_info.full_name} of {filing.company_name}."
+                f"The social media or GitHub profile '{u}' belongs to {exec_info.full_name} of {filing.company_name}."
             )
         for i, u in enumerate(blog_cands[:3]):
             qc_questions[f"blog_{i}"] = (
-                f"The blog '{u}' is authored by {exec_info.full_name} of {filing.company_name}."
+                f"The blog or article '{u}' is authored by or about {exec_info.full_name} / {filing.company_name}."
             )
         for i, u in enumerate(site_cands[:3]):
             qc_questions[f"site_{i}"] = (
-                f"The website '{u}' is the personal website of {exec_info.full_name} of {filing.company_name}."
+                f"The website '{u}' is the personal or portfolio website of {exec_info.full_name} of {filing.company_name}."
+            )
+        for i, em in enumerate(email_cands[:3]):
+            qc_questions[f"email_{i}"] = (
+                f"The email address '{em}' belongs to {exec_info.full_name} of {filing.company_name}."
             )
 
         scores = await self.typesafe.evaluate_noul_batch(
             state={
                 "executive": exec_info.model_dump(),
                 "company": filing.company_name,
+                "company_website": filing.company_website,
                 "industry": filing.industry,
+                "github_profiles_discovered": gh_profile_evidence,
+                "discovered_personal_websites": site_cands[:3],
+                "discovered_emails_from_github_and_websites": email_cands[:3],
                 "linkedin_results": li_results,
                 "web_results": web_results,
             },
             questions=qc_questions,
             audit=audit,
-            step_name=f"TypeSafe QC: Verify Profiles ({exec_info.full_name})",
+            step_name=f"Hop 3a: TypeSafe QC Verify Profiles & Emails ({exec_info.full_name})",
         )
 
         threshold = settings.TYPESAFE_CONFIDENCE_THRESHOLD
@@ -599,32 +970,47 @@ class EnrichmentPipeline:
             if sc >= threshold and (
                 result.linkedin_confidence is None or sc > result.linkedin_confidence
             ):
-                result.linkedin_url = u
+                result.linkedin_url = u if u.startswith(("http://", "https://")) else f"https://{u}"
                 result.linkedin_confidence = sc
 
+        def _fmt_link(val: str) -> str:
+            v = val.strip()
+            if not v or v.startswith(("@", "http://", "https://")):
+                return v
+            if "." in v and " " not in v:
+                return f"https://{v}"
+            return v
+
         result.social_handles = [
-            f"{u} (QC: {scores.get(f'soc_{i}', 0.0):.0%})"
-            for i, u in enumerate(social_cands[:4])
+            f"{_fmt_link(u)} (QC: {scores.get(f'soc_{i}', 0.0):.0%})"
+            for i, u in enumerate(social_cands[:5])
             if scores.get(f"soc_{i}", 0.0) >= threshold
         ]
         result.blogs = [
-            f"{u} (QC: {scores.get(f'blog_{i}', 0.0):.0%})"
+            f"{_fmt_link(u)} (QC: {scores.get(f'blog_{i}', 0.0):.0%})"
             for i, u in enumerate(blog_cands[:3])
             if scores.get(f"blog_{i}", 0.0) >= threshold
         ]
         result.personal_websites = [
-            f"{u} (QC: {scores.get(f'site_{i}', 0.0):.0%})"
+            f"{_fmt_link(u)} (QC: {scores.get(f'site_{i}', 0.0):.0%})"
             for i, u in enumerate(site_cands[:3])
             if scores.get(f"site_{i}", 0.0) >= threshold
         ]
 
-        # 5. Email Lookup & Validation via Apify (and/or Apollo.io when enabled)
+        verified_pivoted_emails = [
+            em
+            for i, em in enumerate(email_cands[:3])
+            if scores.get(f"email_{i}", 0.0) >= threshold
+        ]
+
+        # 5. Email Lookup & Validation via Apify (supports pre-discovered GitHub/web emails OR LinkedIn lookup)
         email, status_msg = await self.apify.find_and_verify_email(
             exec_info=exec_info,
             company_name=filing.company_name,
             company_website=filing.company_website,
             linkedin_url=result.linkedin_url,
             audit=audit,
+            discovered_emails=verified_pivoted_emails,
         )
         if not email and settings.ENRICHER_PROVIDER in ("apollo", "both"):
             email, status_msg = await self.apollo.find_and_verify_email(
